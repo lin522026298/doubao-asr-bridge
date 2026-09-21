@@ -1,0 +1,25 @@
+# Never publish sessions, browser profiles, audio, runtime or local evidence.
+data/
+runtime/
+backups/
+verification/
+__pycache__/
+*.py[cod]
+*.exe
+*.dll
+*.lnk
+*.dpapi
+*.tmp
+*.log
+*.pid
+*.wav
+*.mp3
+*.pcm
+*.webm
+.env
+.env.*
+asr_params.json
+preferences*.json
+session*.json
+login-status.json
+.venv/
