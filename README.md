@@ -17,7 +17,7 @@ OpenLess 录音 → 本机 WebSocket → 豆包网页 ASR
 ```
 
 - **流式（默认推荐）**：复用 OpenLess 的 Qwen Realtime 协议客户端，每收到音频块就向豆包发送。Qwen 只是客户端协议，不使用阿里云服务。
-- **批量（备用）**：兼容 `/v1/audio/transcriptions`；整段上传后分段识别、按顺序拼接。OpenLess 内可选两个独立通道。
+- **批量（备用）**：兼容 `/v1/audio/transcriptions`；整段上传后分段识别、按顺序拼接。子段失败时保留成功结果并标明缺失区间，默认不把部分结果当作完整成功。详见[批量接口与客户端处理](docs/batch-api.md)。OpenLess 内可选两个独立通道。
 - **独立登录**：临时 WebView2 登录窗口；会话由 Windows 当前用户 DPAPI 加密保存。
 - **登录失效提示**：启动时检查本地会话；明确过期、缺失或不可读时弹窗。识别中遇到登录相关拒绝也提供重新登录入口，同一会话连续失败不重复弹窗。
 - **生命周期**：启动器先检查本机服务，再启动 OpenLess；OpenLess 进程退出后停止服务和管理器。关闭主窗口但仍留在托盘不算退出。
@@ -93,9 +93,10 @@ py -3.11 -m venv runtime
 .\runtime\Scripts\python.exe -m pip install -r requirements.txt
 .\runtime\Scripts\python.exe test_stream_protocol.py
 .\runtime\Scripts\python.exe test_login_expiry.py
+.\runtime\Scripts\python.exe -m unittest test_batch_asr -v
 ```
 
-测试不需要登录或网络，也不弹出真实窗口。协议检查覆盖最后短帧、顺序、中间与最终事件、并发拒绝、Origin 拒绝、取消后的清理；登录回归覆盖过期判断、旧会话保守读取、弹窗去重、网络错误分类及两种识别入口。C# 编译命令见 `install.ps1`。不提交编译二进制或个人测试音频。
+测试不需要登录或网络，也不弹出真实窗口。协议检查覆盖最后短帧、顺序、中间与最终事件、并发拒绝、Origin 拒绝、取消后的清理；登录回归覆盖过期判断、旧会话保守读取、弹窗去重、网络错误分类及两种识别入口；批量回归覆盖子段隔离、全局偏移、严格/部分结果、静音与非零噪声、超时及无正文日志。C# 编译命令见 `install.ps1`。不提交编译二进制或个人测试音频。
 
 ## 来源与许可
 

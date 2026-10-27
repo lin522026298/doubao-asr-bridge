@@ -11,12 +11,15 @@ import wave
 import os
 import audioop
 import base64
+import math
 import psutil
+import batch_asr
+from asr_errors import RecognitionFailure
 from credential_store import CREDENTIALS
 from login_state import LoginRequired, load_auth, local_login_status
 from login_notice import LoginNotifier, MESSAGES, credential_version
 from urllib.parse import urlencode
-from aiohttp import web, ClientSession, ClientTimeout, WSMsgType, WSServerHandshakeError
+from aiohttp import web, ClientSession, ClientTimeout, WSMsgType, WSServerHandshakeError, ClientConnectionError
 
 FIXED = dict(version_code='20800', language='zh', device_platform='web', aid='497858',
              real_aid='497858', pkg_type='release_version', pc_version='3.12.3',
@@ -38,6 +41,8 @@ class UpstreamRejected(RuntimeError):
 
 def failure_details(exc):
     global LAST_FAILURE, LAST_FAILURE_VERSION
+    if isinstance(exc, RecognitionFailure):
+        return exc.details()
     reason = None
     if isinstance(exc, LoginRequired):
         reason = exc.reason
@@ -49,11 +54,17 @@ def failure_details(exc):
     if reason in MESSAGES:
         LAST_FAILURE, LAST_FAILURE_VERSION = reason, credential_version()
         NOTIFIER.notify(reason)
-        return {'code': reason, 'message': MESSAGES[reason]}
+        return {'code': reason, 'message': MESSAGES[reason], 'retryable': False, 'recovery': 'relogin_or_check_permissions'}
     if isinstance(exc, UpstreamRejected):
-        return {'code': 'upstream_rejected', 'message': str(exc)}
+        return {'code': 'upstream_rejected', 'message': str(exc), 'retryable': False, 'recovery': 'check_upstream_service'}
+    if isinstance(exc, TimeoutError):
+        return RecognitionFailure('recognition_timeout').details()
+    if isinstance(exc, (ClientConnectionError, ConnectionError)):
+        return {'code': 'network_error', 'message': '豆包连接失败，请检查网络后重试。',
+                'retryable': True, 'recovery': 'retry_range_after_network_recovers'}
     # Never return arbitrary exception strings: URLs may contain credentials.
-    return {'code': 'asr_failed', 'message': '豆包语音识别失败，请检查网络、录音长度或服务状态。'}
+    return {'code': 'asr_failed', 'message': '豆包语音识别失败，请检查网络、录音长度或服务状态。',
+            'retryable': False, 'recovery': 'inspect_diagnostics'}
 
 
 def recognition_succeeded(version):
@@ -83,6 +94,7 @@ async def check_login_on_startup(app):
 async def health(request):
     return web.json_response({'status': 'ok', 'keyboard_hooks': False,
                              'independent_session_saved': CREDENTIALS.exists(),
+                             'batch_result_contract': 'segments-v1', 'recognition_busy': LOCK.locked(),
                              'login': login_status()})
 
 def split_pcm(pcm):
@@ -97,23 +109,8 @@ def split_pcm(pcm):
     if pcm: chunks.append(pcm)
     return chunks
 
-async def recognize_segments(pcm):
-    chunks=split_pcm(pcm)
-    limiter=asyncio.Semaphore(3)
-    started=time.monotonic()
-    async def one(chunk):
-        async with limiter:
-            return await recognize(chunk)
-    tasks=[asyncio.create_task(one(chunk)) for chunk in chunks]
-    try:
-        results=await asyncio.gather(*tasks)
-    finally:
-        for task in tasks:
-            if not task.done():task.cancel()
-        await asyncio.gather(*tasks,return_exceptions=True)
-    return {'text':' '.join(r['text'] for r in results),'audio_seconds':len(pcm)/32000,
-            'elapsed_seconds':round(time.monotonic()-started,3),'segments':len(chunks),
-            'completion':'ordered_segments_quiet_period_heuristic'}
+async def recognize_segments(pcm, audio_offset_seconds=0):
+    return await batch_asr.collect_segments(pcm, split_pcm, recognize, failure_details, audio_offset_seconds)
 
 def pcm_from_wav(data):
     with wave.open(io.BytesIO(data), 'rb') as w:
@@ -134,9 +131,19 @@ async def recognize(pcm, speed=1.0, stream=None, partial=None):
                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'}
     url = 'wss://ws-samantha.doubao.com/samantha/audio/asr?' + urlencode(query)
     started = time.monotonic()
-    state = {'text': '', 'messages': 0, 'last': started, 'finished': False, 'error': None}
+    state = {'text': '', 'messages': 0, 'last': started, 'finished': False, 'error': None,
+             'received_messages': 0, 'result_events': 0, 'empty_result_events': 0}
     async with ClientSession(timeout=ClientTimeout(total=None, sock_connect=10), trust_env=True) as session:
         async with session.ws_connect(url, headers=headers, heartbeat=20) as ws:
+            count = 0
+            def diagnostics():
+                return {'sent_audio_seconds': count / 32000,
+                        'expected_audio_seconds': len(pcm) / 32000 if stream is None else None,
+                        'received_messages': state['received_messages'], 'result_events': state['result_events'],
+                        'empty_result_events': state['empty_result_events'], 'nonempty_result_events': state['messages'],
+                        'upstream_finish': state['finished'], 'upstream_closed': receiver.done(),
+                        'upstream_close_code': getattr(ws, 'close_code', None),
+                        'elapsed_seconds': round(time.monotonic() - started, 3)}
             async def receive():
                 async for msg in ws:
                     if msg.type not in (WSMsgType.TEXT, WSMsgType.BINARY):
@@ -145,16 +152,22 @@ async def recognize(pcm, speed=1.0, stream=None, partial=None):
                         obj = json.loads(msg.data)
                     except (ValueError, UnicodeError):
                         continue
+                    if not isinstance(obj, dict):
+                        continue
+                    state['received_messages'] += 1
                     if obj.get('code', 0) != 0:
                         state['error'] = UpstreamRejected(obj.get('code'))
                         return
                     if obj.get('event') == 'result':
+                        state['result_events'] += 1
                         text = obj.get('result', {}).get('Text', '')
-                        if text:
+                        if isinstance(text, str) and text.strip():
                             state.update(text=text, last=time.monotonic())
                             state['messages'] += 1
                             if partial:
                                 await partial(text)
+                        else:
+                            state['empty_result_events'] += 1
                     if obj.get('event') == 'finish':
                         state['finished'] = True
             receiver = asyncio.create_task(receive())
@@ -164,7 +177,7 @@ async def recognize(pcm, speed=1.0, stream=None, partial=None):
                 if receiver.done():
                     receiver.result()
                     if not state['finished']:
-                        raise RuntimeError('Upstream stream closed')
+                        raise RecognitionFailure('upstream_closed', diagnostics())
             try:
                 # Drain all real audio BEFORE padding/end wait, unlike an interruptible queue.
                 count = 0
@@ -176,7 +189,9 @@ async def recognize(pcm, speed=1.0, stream=None, partial=None):
                 else:
                     for offset in range(0, len(pcm), 3200):
                         check_receiver()
-                        await ws.send_bytes(pcm[offset:offset+3200])
+                        chunk = pcm[offset:offset+3200]
+                        await ws.send_bytes(chunk)
+                        count += len(chunk)
                         await asyncio.sleep(0.1 / speed)
                     count = len(pcm)
                 for _ in range(5):
@@ -195,11 +210,12 @@ async def recognize(pcm, speed=1.0, stream=None, partial=None):
                         break
                     await asyncio.sleep(0.1)
                 if not state['text']:
-                    raise RuntimeError('No transcript received')
+                    raise RecognitionFailure('no_transcript', diagnostics())
                 recognition_succeeded(version)
                 return {'text': state['text'], 'audio_seconds': count/32000,
                         'elapsed_seconds': round(time.monotonic()-started, 3),
                         'result_messages': state['messages'],
+                        'diagnostics': diagnostics(),
                         'completion': 'finish_event' if state['finished'] else 'quiet_period_heuristic'}
             except Exception:
                 # A rejected connection can close while send_bytes is in flight.
@@ -219,20 +235,48 @@ async def transcribe(request):
     try:
         reader = await request.multipart()
         audio = None
+        audio_offset_seconds = 0.0
+        allow_partial = False
+        controls = set()
         async for part in reader:
             if part.name == 'file':
+                if audio is not None:
+                    raise ValueError('Duplicate file')
                 data = bytearray()
                 while chunk := await part.read_chunk():
                     data.extend(chunk)
                     if len(data) > 10_000_000:
                         raise ValueError('Audio too large')
                 audio = bytes(data)
+            elif part.name in ('audio_offset_seconds', 'allow_partial'):
+                if part.name in controls:
+                    raise ValueError('Duplicate control field')
+                controls.add(part.name)
+                value = bytearray()
+                while chunk := await part.read_chunk():
+                    value.extend(chunk)
+                    if len(value) > 64:
+                        raise ValueError('Oversized control field')
+                value = value.decode('utf-8').strip()
+                if part.name == 'audio_offset_seconds':
+                    audio_offset_seconds = float(value)
+                    if not math.isfinite(audio_offset_seconds) or not 0 <= audio_offset_seconds <= 1_000_000_000:
+                        raise ValueError('Invalid audio offset')
+                else:
+                    if value.lower() not in ('true', 'false', '1', '0'):
+                        raise ValueError('Invalid allow_partial')
+                    allow_partial = value.lower() in ('true', '1')
         if audio is None:
             raise ValueError('Missing file')
         pcm = pcm_from_wav(audio)
         async with LOCK:
-            result = await asyncio.wait_for(recognize_segments(pcm), len(pcm)/32000 + 40)
-        return web.json_response(result)
+            result = await recognize_segments(pcm, audio_offset_seconds)
+        result['request_id'] = str(uuid.uuid4())
+        result['allow_partial'] = allow_partial
+        batch_asr.log_incomplete_batch(result)
+        return web.json_response(result, status=batch_asr.response_status(result, allow_partial))
+    except (ValueError, wave.Error, EOFError):
+        return web.json_response({'error': {'code': 'bad_request', 'message': '请检查 WAV 格式、录音长度和请求字段。'}}, status=400)
     except Exception as exc:
         details = failure_details(exc)
         return web.json_response({'error': dict(details, type=type(exc).__name__)}, status=502)

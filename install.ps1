@@ -8,7 +8,7 @@ if (!(Test-Path -LiteralPath $compiler)) { throw '.NET Framework C# compiler is 
 & py -3.11 -c 'import sys; assert sys.version_info[:2] == (3, 11)'
 if ($LASTEXITCODE -ne 0) { throw 'Python 3.11 is required.' }
 New-Item -ItemType Directory -Path $target | Out-Null
-$files = @('bridge.py','credential_store.py','login_state.py','login_notice.py','login.py','manage.py','configure_openless.py',
+$files = @('bridge.py','batch_asr.py','asr_errors.py','credential_store.py','login_state.py','login_notice.py','login.py','manage.py','configure_openless.py',
     'OpenLessLauncher.cs','requirements.txt','README.md','LICENSE','LICENSE-Murmur.txt')
 foreach ($file in $files) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $file) -Destination $target }
 & py -3.11 -m venv (Join-Path $target 'runtime')
