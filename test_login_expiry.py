@@ -97,6 +97,8 @@ class LocalChecks(unittest.TestCase):
             self.assertFalse(notifier.notify('asr_failed'))
             self.assertEqual(spawn.call_count, 3)
             self.assertEqual(spawn.call_args.args[0][-1], 'login_expired')
+            self.assertEqual(spawn.call_args.kwargs['startupinfo'].wShowWindow, 1)
+            self.assertTrue(spawn.call_args.kwargs['startupinfo'].dwFlags & login_notice.subprocess.STARTF_USESHOWWINDOW)
 
     def test_open_notice_does_not_stack(self):
         process = Mock()
@@ -107,6 +109,28 @@ class LocalChecks(unittest.TestCase):
             self.assertTrue(notifier.notify('login_expired'))
             self.assertFalse(notifier.notify('login_expired'))
             spawn.assert_called_once()
+
+    def test_notice_no_does_not_open_login(self):
+        message = Mock(return_value=7)
+        with patch.object(login_notice.ctypes, 'WinDLL', return_value=SimpleNamespace(MessageBoxW=message)), \
+                patch.object(login_notice, 'start_interactive') as launch:
+            self.assertEqual(login_notice.show('login_expired'), 7)
+        launch.assert_not_called()
+        self.assertIn('登录已过期', message.call_args.args[1])
+        self.assertTrue(message.call_args.args[3] & 0x00000100)
+
+    def test_notice_yes_opens_only_existing_login(self):
+        message = Mock(return_value=6)
+        with patch.object(login_notice.ctypes, 'WinDLL', return_value=SimpleNamespace(MessageBoxW=message)), \
+                patch.object(login_notice, 'start_interactive') as launch:
+            self.assertEqual(login_notice.show('login_expired'), 6)
+        launch.assert_called_once_with(login_notice.ROOT / 'login.py')
+
+    def test_notice_api_failure_is_not_reported_as_success(self):
+        with patch.object(login_notice.ctypes, 'WinDLL', return_value=SimpleNamespace(MessageBoxW=Mock(return_value=0))), \
+                patch.object(login_notice.ctypes, 'get_last_error', return_value=5):
+            with self.assertRaises(OSError):
+                login_notice.show('login_expired')
 
 
 class ErrorChecks(unittest.TestCase):

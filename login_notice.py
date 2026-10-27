@@ -25,6 +25,16 @@ def credential_version():
         return None
 
 
+def start_interactive(script, *arguments):
+    # A venv pythonw redirector can inherit the hidden launcher's show state.
+    # Explicitly show this interactive child without creating a console window.
+    startup = subprocess.STARTUPINFO()
+    startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startup.wShowWindow = 1  # SW_SHOWNORMAL
+    return subprocess.Popen([sys.executable, str(script), *arguments], cwd=ROOT,
+                            creationflags=subprocess.CREATE_NO_WINDOW, startupinfo=startup)
+
+
 class LoginNotifier:
     def __init__(self):
         self.notified = False
@@ -40,8 +50,7 @@ class LoginNotifier:
         if self.process is not None and self.process.poll() is None:
             return False
         try:
-            self.process = subprocess.Popen([sys.executable, str(ROOT / 'login_notice.py'), reason],
-                                            cwd=ROOT, creationflags=subprocess.CREATE_NO_WINDOW)
+            self.process = start_interactive(ROOT / 'login_notice.py', reason)
         except OSError:
             return False
         self.version, self.notified = version, True
@@ -60,9 +69,15 @@ def show(reason):
     message.restype = ctypes.c_int
     text = MESSAGES[reason] + '\n\n现在打开豆包登录窗口吗？\n也可稍后打开安装目录的“登录豆包”快捷方式。'
     # YES opens the existing independent login flow. NO leaves the app available.
-    if message(None, text, '豆包 ASR — 需要检查登录', 0x00000004 | 0x00000030) == 6:
-        subprocess.Popen([sys.executable, str(ROOT / 'login.py')], cwd=ROOT,
-                         creationflags=subprocess.CREATE_NO_WINDOW)
+    # Foreground only this actionable notice; default to NO to avoid an
+    # accidental Enter opening another window while the user is typing.
+    answer = message(None, text, '豆包 ASR — 需要检查登录',
+                     0x00000004 | 0x00000030 | 0x00000100 | 0x00010000)
+    if answer == 0:
+        raise ctypes.WinError(ctypes.get_last_error())
+    if answer == 6:
+        start_interactive(ROOT / 'login.py')
+    return answer
 
 
 if __name__ == '__main__':
