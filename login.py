@@ -5,6 +5,7 @@ import time
 from urllib.parse import urlparse
 import webview
 from credential_store import STATE, save_session
+from login_state import AUTH_COOKIES, assess_session, cookie_expiry
 
 STOP = threading.Event()
 IDS = r'''(() => {
@@ -25,15 +26,20 @@ def monitor(window):
             if not ids or not ids.get('device_id') or not ids.get('web_id'):
                 continue
             cookies = {}
+            expiries = {}
             for jar in window.get_cookies():
                 for name, morsel in jar.items():
                     domain = morsel['domain'].lstrip('.')
                     if domain == 'doubao.com' or domain.endswith('.doubao.com'):
                         cookies[name] = morsel.value
-            if not any(cookies.get(key) for key in ('sessionid','sessionid_ss','sid_tt')):
+                        if name in AUTH_COOKIES:
+                            expiries[name] = cookie_expiry(morsel)
+            if not any(cookies.get(key) for key in AUTH_COOKIES):
                 continue
+            value = dict(ids, cookies=cookies, cookie_expiries=expiries, saved_at=time.time())
+            assess_session(value)
             # Presence is not proof of server acceptance. Health state says saved, not validated.
-            save_session(dict(ids, cookies=cookies))
+            save_session(value)
             (STATE / 'login-status.json').write_text(json.dumps({'status':'session_saved',
                 'server_validated':False}), encoding='utf-8')
             window.set_title('豆包 ASR 兼容工具 — 登录信息已保存，可关闭窗口')
