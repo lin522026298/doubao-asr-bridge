@@ -139,9 +139,10 @@ class ErrorChecks(unittest.TestCase):
         self.addCleanup(patch.stopall)
 
     def test_network_errors_do_not_trigger_login_popup_or_leak_url(self):
-        for exc in (TimeoutError('SECRET_URL'), ConnectionError('SECRET_COOKIE')):
+        for exc, expected in ((TimeoutError('SECRET_URL'), 'recognition_timeout'),
+                              (ConnectionError('SECRET_COOKIE'), 'network_error')):
             details = bridge.failure_details(exc)
-            self.assertEqual(details['code'], 'asr_failed')
+            self.assertEqual(details['code'], expected)
             self.assertNotIn('SECRET', json.dumps(details))
         self.notifier.notify.assert_not_called()
 
