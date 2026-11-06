@@ -83,6 +83,39 @@ def key_dialog():
     window.mainloop()
 
 
+def set_cursor_context(enabled):
+    """Live optional setting only: no OpenLess profile/vault/provider changes."""
+    current = json.loads(SETTINGS.read_text(encoding='utf-8')) if SETTINGS.exists() else {}
+    current.update(cursor_context_enabled=bool(enabled), version=VERSION)
+    SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+    write_json(SETTINGS, current)
+
+
+def cursor_dialog():
+    import tkinter as tk
+    from tkinter import ttk
+    from cursor_context import policy
+    state = policy()
+    window = tk.Tk()
+    window.title('Realtime · 光标上下文')
+    window.geometry('610x225')
+    window.configure(padx=20, pady=18)
+    variable = tk.BooleanVar(value=state['enabled'])
+    ttk.Checkbutton(window, text='向 GPT Realtime 提供光标附近文字作为识别参考', variable=variable).pack(anchor='w')
+    ttk.Label(window, text='仅影响 GPT Realtime；遵守 OpenLess 的光标上下文总开关。\n'
+        '每次最多 600 字符。采集失败、超时或未及时准备好就跳过，不另加一次模型调用。\n'
+        '参考文字会随本次语音请求发给 OpenAI，不保存在兼容层日志中。',
+        wraplength=565).pack(anchor='w', pady=14)
+    note = ('OpenLess 总开关已开启。' if state['openless_enabled'] else
+            'OpenLess 光标上下文总开关已关闭，当前不会采集。')
+    ttk.Label(window, text=note).pack(anchor='w')
+    def save():
+        set_cursor_context(variable.get())
+        window.destroy()
+    ttk.Button(window, text='保存，下次录音生效', command=save).pack(anchor='e', pady=9)
+    window.mainloop()
+
+
 def make_style(original, raw_prompt):
     pack = deepcopy(original)
     pack.update(id=STYLE_ID, name='Realtime · 清晰结构',
@@ -132,8 +165,10 @@ def enable(directory, raw_prompt_file=None):
     prefs = deepcopy(prefs)
     prefs.update(activeAsrProvider=PROVIDER_ID, defaultMode='raw', activeStylePackId=STYLE_ID, pipelineMode='traditional')
     prefs['enabledModes'] = list(dict.fromkeys([*prefs.get('enabledModes', []), 'raw']))
-    write_json(SETTINGS, {'enabled': True, 'model': 'gpt-realtime-2.1', 'reasoning': 'low',
-                          'use_history': True, 'history_turns': 2, 'version': VERSION})
+    existing_settings = snapshot['realtime_settings'] or {}
+    write_json(SETTINGS, {**existing_settings, 'enabled': True, 'model': 'gpt-realtime-2.1', 'reasoning': 'low',
+                          'use_history': True, 'history_turns': 2, 'version': VERSION,
+                          'cursor_context_enabled': existing_settings.get('cursor_context_enabled') is True})
     try:
         write_vault(vault)
         write_json(directory / 'style-packs.json', packs)
@@ -163,7 +198,8 @@ def restore(directory, source):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('action', choices=['enable', 'restore', 'key', 'status'])
+    parser.add_argument('action', choices=['enable', 'restore', 'key', 'status', 'cursor'])
+    parser.add_argument('--cursor-mode', choices=['on', 'off', 'status', 'gui'], default='status')
     parser.add_argument('--profile', type=Path)
     parser.add_argument('--import-dpapi', type=Path)
     parser.add_argument('--snapshot', type=Path)
@@ -173,8 +209,17 @@ def main():
         import_key(args.import_dpapi)
     if args.action == 'key':
         key_dialog()
+    elif args.action == 'cursor':
+        if args.cursor_mode == 'gui':
+            cursor_dialog()
+        else:
+            if args.cursor_mode in ('on', 'off'):
+                set_cursor_context(args.cursor_mode == 'on')
+            from cursor_context import policy
+            print(json.dumps({'cursor_context': policy(args.profile)}, ensure_ascii=False))
     elif args.action == 'status':
-        print(json.dumps({'key_status': key_status()}, ensure_ascii=False))
+        from cursor_context import policy
+        print(json.dumps({'key_status': key_status(), 'cursor_context': policy(args.profile)}, ensure_ascii=False))
     elif args.action == 'enable':
         enable(args.profile or profile_dir(), args.raw_prompt_file)
     elif args.snapshot:

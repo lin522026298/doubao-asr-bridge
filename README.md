@@ -4,6 +4,8 @@ Windows 上的外置语音兼容层：豆包网页识别支持独立登录、边
 
 **0.2.0 新增官方 OpenAI Realtime 语音直出**：录音期间上传音频，结束后直接返回整理正文。与豆包共用现有辅助进程；OpenLess 启动即运行，退出即结束。API Key 独立加密保存。安装和两种通道切换见 [Realtime 接入说明](docs/realtime.md)。
 
+**0.3.0 新增可关闭的 Realtime 光标上下文**：按 OpenLess 2.0.1 的 UIA 采集规则读取当前输入框附近最多 600 字符。仅用于 GPT Realtime，尊重 OpenLess 的上下文总开关；读取未及时完成就跳过，不等待额外模型调用。新安装默认关闭，安装目录的 `Realtime光标上下文设置.lnk` 可切换。豆包路由不执行新增读取逻辑。
+
 > 非豆包或 OpenLess 官方项目。它复用登录用户能使用的豆包网页 ASR 协议，不是火山引擎付费 API，也不承诺与 Seed-ASR 2.0 相同的模型、准确率、额度或服务保障。请遵守服务条款，不要用于批量滥用；网页接口变化可能使其失效。
 
 ## 为什么单独建仓库
@@ -86,7 +88,7 @@ cd "$env:LOCALAPPDATA\Programs\DoubaoAsrBridge"
 
 ## 隐私与安全边界
 
-只绑定 `127.0.0.1:18765`，拒绝带 Origin 的浏览器请求；**本机接口无强认证**，同一机器其他本地程序仍可能调用它。不要将端口暴露到局域网/公网。音频会上传当前选择的豆包或 OpenAI 服务，不是离线识别。Realtime 还会上传用于辨认的词典及所选历史上下文。
+只绑定 `127.0.0.1:18765`，拒绝带 Origin 的浏览器请求；**本机接口无强认证**，同一机器其他本地程序仍可能调用它。不要将端口暴露到局域网/公网。音频会上传当前选择的豆包或 OpenAI 服务，不是离线识别。Realtime 还会上传用于辨认的词典、所选历史上下文，以及显式开启且采集成功的光标参考。
 
 `data/session.dpapi`、WebView2 profile、备份、日志和录音绝不能上传仓库；DPAPI 保护文件不等于保护同用户恶意进程。代码不记录 Cookies 或上游带凭据 URL。默认仅用独立登录；旧测试兼容选项 `DOUBAO_BRIDGE_ALLOW_MURMUR=1` 会显式读取当前用户 Murmur 配置，不建议日常开启。
 
@@ -99,10 +101,13 @@ py -3.11 -m venv runtime
 .\runtime\Scripts\python.exe test_login_expiry.py
 .\runtime\Scripts\python.exe -m unittest test_batch_asr -v
 .\runtime\Scripts\python.exe -m unittest test_openai_realtime -v
+.\runtime\Scripts\python.exe -m unittest test_cursor_context -v
 ```
 
 测试不需要登录或网络，也不弹出真实窗口。协议检查覆盖最后短帧、顺序、中间与最终事件、并发拒绝、Origin 拒绝、取消后的清理；登录回归覆盖过期判断、旧会话保守读取、弹窗去重、网络错误分类及两种识别入口；批量回归覆盖子段隔离、全局偏移、严格/部分结果、静音与非零噪声、超时及无正文日志；Realtime 回归覆盖初始化缓冲、连续重采样、最终结果先回传、失败后半截文本、取消释放，以及配置和凭据保护。C# 编译命令见 `install.ps1`。不提交编译二进制或个人测试音频。
 
 ## 来源与许可
 
-豆包协议与登录思路来自 [lilong7676/doubao-murmur](https://github.com/lilong7676/doubao-murmur)，保留其 MIT 许可 [LICENSE-Murmur.txt](LICENSE-Murmur.txt)。适配器、启动管理与测试在本仓库维护，采用 [MIT](LICENSE) 许可。
+豆包协议与登录思路来自 [lilong7676/doubao-murmur](https://github.com/lilong7676/doubao-murmur)，保留其 MIT 许可 [LICENSE-Murmur.txt](LICENSE-Murmur.txt)。原适配器、启动管理与 Python 测试在本仓库维护，采用 [MIT](LICENSE) 许可。
+
+独立的 `cursor_reader/` 组件移植自 OpenLess 2.0.1 的光标采集和参考提示词，单独采用 [AGPL-3.0-only](cursor_reader/LICENSE-AGPL-3.0.txt)，不适用根目录 MIT 声明。来源、修改和限制见 [UPSTREAM.md](cursor_reader/UPSTREAM.md)。源码随仓库提供，由安装脚本在本机编译；它与桥接服务只通过匿名管道交换一次请求的数据，没有网络服务或独立自启动项。

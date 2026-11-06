@@ -16,6 +16,7 @@ from aiohttp import web, ClientSession, ClientTimeout, ClientWSTimeout, WSMsgTyp
 from credential_store import STATE
 from openai_credentials import load_key, key_status
 from realtime_profile import prompt_snapshot
+from cursor_context import begin_capture, policy as cursor_policy
 
 MODEL = 'gpt-realtime-2.1'
 UPSTREAM = 'wss://api.openai.com/v1/realtime?model=' + MODEL
@@ -67,12 +68,15 @@ def record_metrics(value):
 
 def health_status():
     return {'model': MODEL, 'key_status': key_status(), 'last_result': LAST_RESULT,
-            'audio_input': 'streaming', 'output': 'prepared_text', 'reasoning': 'low'}
+            'audio_input': 'streaming', 'output': 'prepared_text', 'reasoning': 'low',
+            'cursor_context': cursor_policy()}
 
 
 class RealtimeEngine:
-    def __init__(self, *, upstream=UPSTREAM, key_loader=load_key, prompt_loader=prompt_snapshot):
+    def __init__(self, *, upstream=UPSTREAM, key_loader=load_key, prompt_loader=prompt_snapshot,
+                 cursor_factory=begin_capture):
         self.upstream, self.key_loader, self.prompt_loader = upstream, key_loader, prompt_loader
+        self.cursor_factory = cursor_factory
 
     async def run(self, stream, ready, partial, completed):
         try:
@@ -87,7 +91,12 @@ class RealtimeEngine:
         pieces = []
         commit_time = first_time = None
         sender = receiver = ws = None
+        cursor = None
         try:
+            try:
+                cursor = self.cursor_factory()
+            except Exception:
+                pass  # Optional capture must not break an otherwise valid recording.
             async with ClientSession(timeout=ClientTimeout(total=None, sock_connect=4), trust_env=True) as session:
                 async with asyncio.timeout(4.5):
                     try:
@@ -103,6 +112,13 @@ class RealtimeEngine:
                     first = await ws.receive_json()
                     if first.get('type') == 'error':
                         raise upstream_failure(first.get('error'))
+                    if cursor is not None:
+                        try:
+                            block = cursor.take_ready()
+                        except Exception:
+                            block = None
+                        if block:
+                            prompt += '\n\n' + block
                     await ws.send_json({'type': 'session.update', 'session': {
                         'type': 'realtime', 'output_modalities': ['text'], 'instructions': prompt,
                         'reasoning': {'effort': 'low'}, 'max_output_tokens': 4096,
@@ -198,6 +214,12 @@ class RealtimeEngine:
                     await asyncio.wait_for(ws.close(), 1)
                 except (TimeoutError, ClientError, ConnectionError):
                     pass
+            if cursor is not None:
+                try:
+                    await cursor.close()
+                    metrics['cursor_context'] = dict(cursor.metadata)
+                except Exception:
+                    metrics['cursor_context'] = {'status': 'unavailable', 'forwarded': False}
             metrics['elapsed_s'] = round(time.monotonic() - start, 3)
             try:
                 record_metrics(metrics)

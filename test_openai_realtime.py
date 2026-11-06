@@ -37,7 +37,8 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.server = TestServer(app)
         await self.server.start_server()
         engine = rt.RealtimeEngine(upstream=str(self.server.make_url('/upstream')),
-                     key_loader=lambda: 'synthetic-key', prompt_loader=lambda: ('Synthetic prompt', {'history_turns': 0}))
+                     key_loader=lambda: 'synthetic-key', prompt_loader=lambda: ('Synthetic prompt', {'history_turns': 0}),
+                     cursor_factory=lambda: None)
         local = web.Application()
         async def route(request):
             return await rt.handle(request, self.lock, engine)

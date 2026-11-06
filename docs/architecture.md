@@ -18,7 +18,9 @@
 
 `GET /v1/realtime/openai` 使用同样的本地客户端事件和全局单请求锁，复用已有 Python 进程。立即确认本地会话，把初始化期间音频排队；上游建立后连续重采样为 24 kHz PCM16 并上传。`session.finish` 后排空音频、手动 commit 并创建唯一的纯文字响应。完整最终文本和 `session.finished` 先发给 OpenLess，再关闭上游，避免连接清理增加可见等待。错误与不完整响应均明确失败，不把 partial 当成功。
 
-`configure_realtime.py` 以 DPAPI 备份原配置和凭据，添加独立 ASR 通道及 Raw 直通风格。只有默认 Raw 提示词精确匹配支持版本的哈希才启用，避免隐藏的第二遍 LLM。实际整理指令、词典和最近两轮同风格历史由 `realtime_profile.py` 在每次请求取快照，密钥独立保存。没有光标上下文转发、录音中逐字预览、自动重试或隐式通道降级；切回豆包需同时恢复原润色风格。详见[Realtime 说明](realtime.md)。
+`configure_realtime.py` 以 DPAPI 备份原配置和凭据，添加独立 ASR 通道及 Raw 直通风格。只有默认 Raw 提示词精确匹配支持版本的哈希才启用，避免隐藏的第二遍 LLM。实际整理指令、词典和最近两轮同风格历史由 `realtime_profile.py` 在每次请求取快照，密钥独立保存。没有录音中逐字预览、自动重试或隐式通道降级；切回豆包需同时恢复原润色风格。详见[Realtime 说明](realtime.md)。
+
+0.3.0 中 `cursor_context.py` 只由 Realtime 引擎按需调用，同时检查独立开关和 OpenLess 总开关。独立 `cursor_reader/` 程序移植上游 UIA 采集合同，使用匿名管道，不提供网络端口。采集与上游握手并行；在会话配置时只取已经完成、目标身份仍匹配的参考，否则丢弃并继续。请求取消或超时会杀掉读取器；读取器自身还有短生命周期保护。诊断只记录状态、计数和耗时。豆包入口不调用此模块的采集函数。
 
 ## Lifetime
 
