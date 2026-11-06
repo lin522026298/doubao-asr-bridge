@@ -1,6 +1,8 @@
-# Doubao ASR Bridge for OpenLess
+# OpenLess Voice Bridge（豆包 / OpenAI Realtime）
 
-Windows 上的实验性豆包网页语音识别兼容层：独立登录、边录边传、批量备用，以及与 OpenLess 的启停联动。无需让 Murmur 常驻，不注册全局快捷键，不访问麦克风，不负责文字回填。
+Windows 上的外置语音兼容层：豆包网页识别支持独立登录、边录边传和批量备用；官方 OpenAI Realtime 支持语音直接生成整理正文。两种通道共用 OpenLess 的启停联动。无需让 Murmur 常驻，不注册全局快捷键，不访问麦克风，不负责文字回填。
+
+**0.2.0 新增官方 OpenAI Realtime 语音直出**：录音期间上传音频，结束后直接返回整理正文。与豆包共用现有辅助进程；OpenLess 启动即运行，退出即结束。API Key 独立加密保存。安装和两种通道切换见 [Realtime 接入说明](docs/realtime.md)。
 
 > 非豆包或 OpenLess 官方项目。它复用登录用户能使用的豆包网页 ASR 协议，不是火山引擎付费 API，也不承诺与 Seed-ASR 2.0 相同的模型、准确率、额度或服务保障。请遵守服务条款，不要用于批量滥用；网页接口变化可能使其失效。
 
@@ -9,6 +11,8 @@ Windows 上的实验性豆包网页语音识别兼容层：独立登录、边录
 本项目是外置协议适配工具，不修改 OpenLess 官方二进制。它涉及独立的网页登录状态、上游非公开协议和 Windows 生命周期管理，先独立发布更容易维护、回滚和说明支持范围。将来若 OpenLess 维护者愿意接纳，可讨论通用外部 ASR / sidecar 支持，再提交聚焦的上游 PR。
 
 ## 工作方式
+
+豆包链路如下；Realtime 直接返回整理正文，跳过普通听写的独立润色，详见[专用说明](docs/realtime.md)。
 
 ```text
 OpenLess 录音 → 本机 WebSocket → 豆包网页 ASR
@@ -82,7 +86,7 @@ cd "$env:LOCALAPPDATA\Programs\DoubaoAsrBridge"
 
 ## 隐私与安全边界
 
-只绑定 `127.0.0.1:18765`，拒绝带 Origin 的浏览器请求；**本机接口无强认证**，同一机器其他本地程序仍可能调用它。不要将端口暴露到局域网/公网。音频会上传豆包，不是离线识别。
+只绑定 `127.0.0.1:18765`，拒绝带 Origin 的浏览器请求；**本机接口无强认证**，同一机器其他本地程序仍可能调用它。不要将端口暴露到局域网/公网。音频会上传当前选择的豆包或 OpenAI 服务，不是离线识别。Realtime 还会上传用于辨认的词典及所选历史上下文。
 
 `data/session.dpapi`、WebView2 profile、备份、日志和录音绝不能上传仓库；DPAPI 保护文件不等于保护同用户恶意进程。代码不记录 Cookies 或上游带凭据 URL。默认仅用独立登录；旧测试兼容选项 `DOUBAO_BRIDGE_ALLOW_MURMUR=1` 会显式读取当前用户 Murmur 配置，不建议日常开启。
 
@@ -94,9 +98,10 @@ py -3.11 -m venv runtime
 .\runtime\Scripts\python.exe test_stream_protocol.py
 .\runtime\Scripts\python.exe test_login_expiry.py
 .\runtime\Scripts\python.exe -m unittest test_batch_asr -v
+.\runtime\Scripts\python.exe -m unittest test_openai_realtime -v
 ```
 
-测试不需要登录或网络，也不弹出真实窗口。协议检查覆盖最后短帧、顺序、中间与最终事件、并发拒绝、Origin 拒绝、取消后的清理；登录回归覆盖过期判断、旧会话保守读取、弹窗去重、网络错误分类及两种识别入口；批量回归覆盖子段隔离、全局偏移、严格/部分结果、静音与非零噪声、超时及无正文日志。C# 编译命令见 `install.ps1`。不提交编译二进制或个人测试音频。
+测试不需要登录或网络，也不弹出真实窗口。协议检查覆盖最后短帧、顺序、中间与最终事件、并发拒绝、Origin 拒绝、取消后的清理；登录回归覆盖过期判断、旧会话保守读取、弹窗去重、网络错误分类及两种识别入口；批量回归覆盖子段隔离、全局偏移、严格/部分结果、静音与非零噪声、超时及无正文日志；Realtime 回归覆盖初始化缓冲、连续重采样、最终结果先回传、失败后半截文本、取消释放，以及配置和凭据保护。C# 编译命令见 `install.ps1`。不提交编译二进制或个人测试音频。
 
 ## 来源与许可
 

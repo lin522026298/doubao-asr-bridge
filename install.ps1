@@ -9,8 +9,14 @@ if (!(Test-Path -LiteralPath $compiler)) { throw '.NET Framework C# compiler is 
 if ($LASTEXITCODE -ne 0) { throw 'Python 3.11 is required.' }
 New-Item -ItemType Directory -Path $target | Out-Null
 $files = @('bridge.py','batch_asr.py','asr_errors.py','credential_store.py','login_state.py','login_notice.py','login.py','manage.py','configure_openless.py',
+    'openai_credentials.py','openai_realtime.py','realtime_profile.py','realtime-prompt.txt','configure_realtime.py','bridge_version.py',
     'OpenLessLauncher.cs','requirements.txt','README.md','LICENSE','LICENSE-Murmur.txt')
 foreach ($file in $files) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $file) -Destination $target }
+$docs = Join-Path $target 'docs'
+New-Item -ItemType Directory -Path $docs | Out-Null
+foreach ($file in @('realtime.md','batch-api.md')) {
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot ('docs\' + $file)) -Destination $docs
+}
 & py -3.11 -m venv (Join-Path $target 'runtime')
 if ($LASTEXITCODE -ne 0) { throw 'Virtual environment creation failed.' }
 $python = Join-Path $target 'runtime\Scripts\python.exe'
