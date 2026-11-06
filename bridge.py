@@ -14,6 +14,9 @@ import base64
 import math
 import psutil
 import batch_asr
+import openai_realtime
+import realtime_profile
+from bridge_version import __version__
 from asr_errors import RecognitionFailure
 from credential_store import CREDENTIALS
 from login_state import LoginRequired, load_auth, local_login_status
@@ -88,14 +91,15 @@ def login_status():
 
 async def check_login_on_startup(app):
     status = local_login_status()
-    NOTIFIER.notify(status['status'])
+    if not realtime_profile.enabled():
+        NOTIFIER.notify(status['status'])
 
 
 async def health(request):
-    return web.json_response({'status': 'ok', 'keyboard_hooks': False,
+    return web.json_response({'status': 'ok', 'bridge_version': __version__, 'keyboard_hooks': False,
                              'independent_session_saved': CREDENTIALS.exists(),
                              'batch_result_contract': 'segments-v1', 'recognition_busy': LOCK.locked(),
-                             'login': login_status()})
+                             'login': login_status(), 'openai_realtime': openai_realtime.health_status()})
 
 def split_pcm(pcm):
     """Cut near low-energy audio, retaining every byte exactly once."""
@@ -340,7 +344,11 @@ async def realtime(request):
             await client.close()
         return client
 
-def main():
+async def openai_stream(request):
+    return await openai_realtime.handle(request, LOCK)
+
+
+def create_app():
     app = web.Application(client_max_size=10_000_000)
     app.on_startup.append(check_login_on_startup)
     owner = os.environ.get('DOUBAO_BRIDGE_OWNER_PID')
@@ -361,6 +369,12 @@ def main():
     app.router.add_get('/v1/models', lambda _: web.json_response({'data': [{'id': 'doubao-web-asr', 'object': 'model'}]}))
     app.router.add_post('/v1/audio/transcriptions', transcribe)
     app.router.add_get('/v1/realtime', realtime)
+    app.router.add_get('/v1/realtime/openai', openai_stream)
+    return app
+
+
+def main():
+    app = create_app()
     web.run_app(app, host='127.0.0.1', port=18765, access_log=None, print=None)
 
 if __name__ == '__main__':

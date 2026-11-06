@@ -14,6 +14,12 @@
 
 返回 `segment_results`、`complete`、`partial` 与全局 `missing_ranges`；默认不完整即 HTTP 502，显式允许部分结果的客户端可取得 200，但 `complete` 仍为 false。全部无文本为 422。详细字段、恢复和兼容边界见[批量接口](batch-api.md)。不完整批次的日志仅记录数值与状态白名单，按约 1 MB、一个备份文件轮转，无音频或转写正文。
 
+## OpenAI Realtime
+
+`GET /v1/realtime/openai` 使用同样的本地客户端事件和全局单请求锁，复用已有 Python 进程。立即确认本地会话，把初始化期间音频排队；上游建立后连续重采样为 24 kHz PCM16 并上传。`session.finish` 后排空音频、手动 commit 并创建唯一的纯文字响应。完整最终文本和 `session.finished` 先发给 OpenLess，再关闭上游，避免连接清理增加可见等待。错误与不完整响应均明确失败，不把 partial 当成功。
+
+`configure_realtime.py` 以 DPAPI 备份原配置和凭据，添加独立 ASR 通道及 Raw 直通风格。只有默认 Raw 提示词精确匹配支持版本的哈希才启用，避免隐藏的第二遍 LLM。实际整理指令、词典和最近两轮同风格历史由 `realtime_profile.py` 在每次请求取快照，密钥独立保存。没有光标上下文转发、录音中逐字预览、自动重试或隐式通道降级；切回豆包需同时恢复原润色风格。详见[Realtime 说明](realtime.md)。
+
 ## Lifetime
 
 C# 启动器采用当前登录会话命名互斥量，避免重复生命周期管理者。它启动 Python 服务，等待 health，然后启动/接管官方 OpenLess。每 500ms 检查目标安装路径的 OpenLess；退出后停止本安装 PID 对应的进程树。Python 服务另监测启动器 PID，避免启动器崩溃后遗留服务。
@@ -28,7 +34,7 @@ C# 启动器采用当前登录会话命名互斥量，避免重复生命周期�
 
 `login.py` 在已有的 DPAPI 会话中增加 `cookie_expiries`（Unix 秒）与 `saved_at`。`login_state.py` 仅在所有现存认证 Cookie 的有效期均已知且均已到期时判断为过期；任一认证 Cookie 仍可能有效时保留未验证状态。旧格式不强制迁移或覆盖，最多只读独立 WebView2 Cookie 数据库中的名称、创建时间和有效期。创建时间必须在对应会话保存前 60 秒到保存后 5 秒内，所有认证 Cookie 均可关联才采用，其他情况保持未知。数据库连接显式关闭，不留占用。
 
-服务启动的本地检查不依赖网络，不阻塞 OpenLess 启动。health 的 `status` 保留服务健康含义，`login` 单独报告会话状态。实际识别成功才设置当前会话的 `server_validated`；凭据文件版本改变后复位，元数据到期优先于旧的验证结果。
+服务启动的本地检查不依赖网络，不阻塞 OpenLess 启动。Realtime 主用设置启用时，跳过无关豆包启动弹窗；实际调用豆包仍检查并提示。health 的 `status` 保留服务健康含义，`login` 单独报告会话状态。实际识别成功才设置当前会话的 `server_validated`；凭据文件版本改变后复位，元数据到期优先于旧的验证结果。
 
 识别入口保留经过限定的错误类型和数字上游码，不把带凭据的网络异常文本回传。`710022013` 属于需要检查登录的线索，401/403 属于认证或权限被拒绝，都不宣称精确证明过期；普通网络故障不触发登录弹窗。实时客户端仍收到 `transcription.failed`，不会把失败前的 partial 当作最终成功。
 
