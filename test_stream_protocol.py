@@ -48,4 +48,5 @@ async def main():
         assert not bridge.LOCK.locked(), 'cancel leaked lock'
     print('PASS: interim/final ordering, exact tail bytes, browser rejection, busy rejection, cancellation cleanup')
 
-asyncio.run(main())
+if __name__ == '__main__':
+    asyncio.run(main())

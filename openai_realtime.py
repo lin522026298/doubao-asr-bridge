@@ -17,6 +17,7 @@ from credential_store import STATE
 from openai_credentials import load_key, key_status
 from realtime_profile import prompt_snapshot
 from cursor_context import begin_capture, policy as cursor_policy
+from realtime_text import normalize_output
 
 MODEL = 'gpt-realtime-2.1'
 UPSTREAM = 'wss://api.openai.com/v1/realtime?model=' + MODEL
@@ -138,12 +139,20 @@ class RealtimeEngine:
                     nonlocal commit_time
                     state = None
                     nonzero = False
+                    energy = frames = peak = 0
                     async for chunk in stream:
                         metrics['audio_bytes'] += len(chunk)
-                        nonzero = nonzero or audioop.max(chunk, 2) != 0
+                        chunk_peak = audioop.max(chunk, 2)
+                        nonzero = nonzero or chunk_peak != 0
+                        peak = max(peak, chunk_peak)
+                        count = len(chunk) // 2
+                        frames += count
+                        energy += audioop.rms(chunk, 2) ** 2 * count
                         converted, state = audioop.ratecv(chunk, 2, 1, 16000, 24000, state)
                         if converted:
                             await ws.send_json({'type': 'input_audio_buffer.append', 'audio': base64.b64encode(converted).decode('ascii')})
+                    metrics.update(audio_duration_ms=round(frames / 16), audio_peak=peak,
+                                   audio_rms=round((energy / frames) ** .5, 1) if frames else 0)
                     if metrics['audio_bytes'] < 3200:
                         raise RealtimeFailure('audio_too_short', '录音太短，请再说一次。', True)
                     if not nonzero:
@@ -185,15 +194,28 @@ class RealtimeEngine:
                         pieces.append(event['text'])
                     if kind == 'response.done':
                         response = event.get('response', {})
-                        if response.get('status') != 'completed' or not ''.join(pieces).strip():
+                        status = response.get('status')
+                        metrics['upstream_status'] = status if status in ('completed', 'incomplete', 'failed', 'cancelled') else 'unknown'
+                        details = response.get('status_details')
+                        reason = details.get('reason') if isinstance(details, dict) else None
+                        if reason is not None:
+                            metrics['upstream_stop_reason'] = reason if reason in ('max_output_tokens', 'content_filter', 'turn_detected', 'client_cancelled') else 'unknown'
+                        usage = response.get('usage')
+                        if not isinstance(usage, dict):
+                            usage = {}
+                        for name in ('input_tokens', 'output_tokens'):
+                            value = usage.get(name)
+                            if type(value) is int and value >= 0:
+                                metrics[name] = value
+                        if status != 'completed':
                             raise RealtimeFailure('realtime_incomplete', 'Realtime 未返回完整文字，请重试。', True)
                         text = ''.join(pieces).strip()
+                        if not text:
+                            raise RealtimeFailure('realtime_no_text', '没有识别到可插入的文字，请检查麦克风和录音后重试。', True)
+                        text, metrics['text_normalization'] = normalize_output(text)
                         metrics.update(status='ok', output_chars=len(text),
                             after_commit_s=round(time.monotonic() - commit_time, 3) if commit_time is not None else None,
                             first_after_commit_s=round(first_time - commit_time, 3) if first_time is not None and commit_time is not None else None)
-                        usage = response.get('usage', {})
-                        metrics['input_tokens'] = usage.get('input_tokens')
-                        metrics['output_tokens'] = usage.get('output_tokens')
                         await completed(text)
                         await ws.close()
                         return

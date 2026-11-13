@@ -69,14 +69,19 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                 elif kind == 'input_audio_buffer.append':
                     self.received.append(base64.b64decode(event['audio']))
                 elif kind == 'response.create':
-                    await ws.send_json({'type': 'response.output_text.delta', 'delta': '中英 '})
+                    if self.behavior == 'empty_completed':
+                        await ws.send_json({'type': 'response.done', 'response': {'status': 'completed',
+                            'usage': {'input_tokens': 10, 'output_tokens': 0}}})
+                        continue
+                    await ws.send_json({'type': 'response.output_text.delta', 'delta': '這是 ' if self.behavior == 'traditional' else '中英 '})
                     if self.behavior == 'upstream_error':
                         await ws.send_json({'type': 'error', 'error': {'code': 'invalid_api_key', 'message': 'do not expose synthetic-key'}})
                         continue
-                    await ws.send_json({'type': 'response.output_text.delta', 'delta': 'mixed 完成'})
+                    await ws.send_json({'type': 'response.output_text.delta', 'delta': 'API，目的是什麼？' if self.behavior == 'traditional' else 'mixed 完成'})
                     await ws.send_json({'type': 'response.done', 'response': {
                         'status': 'incomplete' if self.behavior == 'incomplete' else 'completed',
-                        'usage': {'input_tokens': 10, 'output_tokens': 5}}})
+                        'status_details': {'reason': 'max_output_tokens'} if self.behavior == 'incomplete' else None,
+                        'usage': None if self.behavior == 'null_usage' else {'input_tokens': 10, 'output_tokens': 5}}})
                     if self.behavior == 'hold_close':
                         await self.release.wait()
         finally:
@@ -153,6 +158,52 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         await self.send(ws)
         events = await self.events(ws)
         self.assertEqual(events[-1]['error']['code'], 'realtime_incomplete')
+        await ws.close()
+        await asyncio.sleep(.05)
+        self.assertEqual(self.metrics[-1]['upstream_status'], 'incomplete')
+        self.assertEqual(self.metrics[-1]['upstream_stop_reason'], 'max_output_tokens')
+
+    async def test_completed_but_empty_is_distinct_from_truncation(self):
+        self.behavior = 'empty_completed'
+        ws = await self.open_stream()
+        await self.send(ws)
+        events = await self.events(ws)
+        self.assertEqual(events[-1]['error']['code'], 'realtime_no_text')
+        self.assertFalse(any(e['type'].endswith('.completed') for e in events))
+        await ws.close()
+        await asyncio.sleep(.05)
+        self.assertEqual(self.metrics[-1]['upstream_status'], 'completed')
+        self.assertEqual(self.metrics[-1]['output_tokens'], 0)
+
+    async def test_quiet_nonzero_audio_is_not_filtered(self):
+        ws = await self.open_stream()
+        await self.send(ws, [b'\x01\x00' * 1600])
+        events = await self.events(ws)
+        self.assertEqual(events[-1]['type'], 'session.finished')
+        await ws.close()
+        await asyncio.sleep(.05)
+        self.assertEqual(self.metrics[-1]['audio_rms'], 1)
+        self.assertEqual(self.metrics[-1]['audio_peak'], 1)
+        self.assertEqual(self.metrics[-1]['audio_duration_ms'], 100)
+
+    async def test_only_final_text_is_normalized_without_another_response(self):
+        self.behavior = 'traditional'
+        ws = await self.open_stream()
+        await self.send(ws)
+        events = await self.events(ws)
+        self.assertEqual(events[-2]['transcript'], '这是 API，目的是什么？')
+        self.assertEqual(sum(e['type'].endswith('.completed') for e in events), 1)
+        await ws.close()
+        await asyncio.sleep(.05)
+        self.assertTrue(self.metrics[-1]['text_normalization']['changed'])
+
+    async def test_optional_usage_diagnostics_do_not_break_valid_text(self):
+        self.behavior = 'null_usage'
+        ws = await self.open_stream()
+        await self.send(ws)
+        events = await self.events(ws)
+        self.assertEqual(events[-1]['type'], 'session.finished')
+        self.assertEqual(events[-2]['transcript'], '中英 mixed 完成')
 
     async def test_silence_does_not_create_a_response(self):
         ws = await self.open_stream()
