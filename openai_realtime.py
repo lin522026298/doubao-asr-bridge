@@ -15,14 +15,24 @@ from datetime import datetime, timezone
 from aiohttp import web, ClientSession, ClientTimeout, ClientWSTimeout, WSMsgType, ClientError
 from credential_store import STATE
 from openai_credentials import load_key, key_status
-from realtime_profile import prompt_snapshot
+from realtime_profile import prompt_snapshot, SETTINGS as REALTIME_SETTINGS
 from cursor_context import begin_capture, policy as cursor_policy
 from realtime_text import normalize_output
 
 MODEL = 'gpt-realtime-2.1'
 UPSTREAM = 'wss://api.openai.com/v1/realtime?model=' + MODEL
 MAX_AUDIO_BYTES = 32000 * 300
+DEFAULT_REASONING = 'low'
+REASONING_EFFORTS = frozenset(('minimal', 'low', 'medium', 'high', 'xhigh'))
+# Accepted by a targeted gpt-realtime-2.1 probe, but outside the stable schema.
+# This opt-in does not guarantee the model performs no internal reasoning.
+EXPERIMENTAL_REASONING_EFFORTS = frozenset(('none',))
+COMPAT_REASONING_FALLBACK = 'low'
+EFFORT_SCHEMA_ERRORS = frozenset(('invalid_value', 'unsupported_value', 'invalid_parameter',
+                                 'invalid_enum_value', 'unsupported_parameter_value'))
+EFFORT_ERROR_PARAMS = frozenset(('session.reasoning.effort', 'reasoning.effort'))
 LAST_RESULT = None
+ACTIVE_REASONING = None
 
 
 class RealtimeFailure(Exception):
@@ -67,19 +77,77 @@ def record_metrics(value):
     logger.info(json.dumps(value, ensure_ascii=False))
 
 
-def health_status():
+def load_realtime_settings():
+    try:
+        with REALTIME_SETTINGS.open('rb') as source:
+            raw = source.read(8_000_001)
+    except FileNotFoundError:
+        return {}
+    if len(raw) > 8_000_000:
+        raise ValueError('Realtime settings exceed the size limit')
+    return json.loads(raw)
+
+
+def reasoning_snapshot(settings_loader=load_realtime_settings):
+    """Return only safe diagnostics; never retain raw settings or loader errors."""
+    try:
+        config = settings_loader()
+        if not isinstance(config, dict):
+            return {'effort': DEFAULT_REASONING, 'status': 'invalid_fallback',
+                    'reason': 'invalid_settings'}
+        if 'reasoning' not in config:
+            return {'effort': DEFAULT_REASONING, 'status': 'default'}
+        value = config['reasoning']
+        effort = value.strip().lower() if isinstance(value, str) else None
+        if effort in REASONING_EFFORTS:
+            return {'effort': effort, 'status': 'configured'}
+        if effort in EXPERIMENTAL_REASONING_EFFORTS:
+            return {'effort': effort, 'status': 'configured_experimental',
+                    'compat_fallback_enabled': config.get('reasoning_compat_fallback', True) is True}
+    except Exception:
+        return {'effort': DEFAULT_REASONING, 'status': 'unavailable_fallback',
+                'reason': 'settings_read_failed'}
+    return {'effort': DEFAULT_REASONING, 'status': 'invalid_fallback',
+            'reason': 'unsupported_effort'}
+
+
+def effort_schema_rejection(error):
+    """Recognize only a precise effort-field rejection, without reading its message."""
+    if not isinstance(error, dict):
+        return None
+    code, param, kind = error.get('code'), error.get('param'), error.get('type')
+    if not isinstance(code, str) or code not in EFFORT_SCHEMA_ERRORS:
+        return None
+    if not isinstance(param, str) or param not in EFFORT_ERROR_PARAMS:
+        return None
+    if kind is not None and kind not in ('invalid_request_error', 'validation_error', 'schema_error', *EFFORT_SCHEMA_ERRORS):
+        return None
+    return {'code': code, 'param': param}
+
+
+def health_status(*, settings_loader=load_realtime_settings):
+    configured = reasoning_snapshot(settings_loader)
+    active = ACTIVE_REASONING
     return {'model': MODEL, 'key_status': key_status(), 'last_result': LAST_RESULT,
-            'audio_input': 'streaming', 'output': 'prepared_text', 'reasoning': 'low',
+            'audio_input': 'streaming', 'output': 'prepared_text',
+            'reasoning': (active or configured)['effort'],
+            'reasoning_source': 'active_recording' if active is not None else 'next_recording',
+            'reasoning_config': configured,
+            'active_reasoning': dict(active) if active is not None else None,
             'cursor_context': cursor_policy()}
 
 
 class RealtimeEngine:
     def __init__(self, *, upstream=UPSTREAM, key_loader=load_key, prompt_loader=prompt_snapshot,
-                 cursor_factory=begin_capture):
+                 cursor_factory=begin_capture, settings_loader=load_realtime_settings):
         self.upstream, self.key_loader, self.prompt_loader = upstream, key_loader, prompt_loader
         self.cursor_factory = cursor_factory
+        self.settings_loader = settings_loader
 
     async def run(self, stream, ready, partial, completed):
+        global ACTIVE_REASONING
+        reasoning = reasoning_snapshot(self.settings_loader)
+        active_reasoning = dict(reasoning, configured_effort=reasoning['effort'], session_accepted=False)
         try:
             key = self.key_loader()
         except Exception:
@@ -87,6 +155,9 @@ class RealtimeEngine:
         prompt, prompt_meta = self.prompt_loader()
         start = time.monotonic()
         metrics = {'model': MODEL, 'status': 'cancelled', 'audio_bytes': 0, 'output_chars': 0,
+                   'reasoning': reasoning['effort'], 'reasoning_config': dict(reasoning),
+                   'reasoning_sent': [], 'reasoning_session_accepted': None,
+                   'reasoning_fallback': None,
                    'dictionary_entries': prompt_meta.get('dictionary_entries', 0),
                    'history_turns': prompt_meta.get('history_turns', 0)}
         pieces = []
@@ -94,6 +165,7 @@ class RealtimeEngine:
         sender = receiver = ws = None
         cursor = None
         try:
+            ACTIVE_REASONING = active_reasoning
             try:
                 cursor = self.cursor_factory()
             except Exception:
@@ -120,17 +192,38 @@ class RealtimeEngine:
                             block = None
                         if block:
                             prompt += '\n\n' + block
-                    await ws.send_json({'type': 'session.update', 'session': {
+                    session_update = {'type': 'session.update', 'session': {
                         'type': 'realtime', 'output_modalities': ['text'], 'instructions': prompt,
-                        'reasoning': {'effort': 'low'}, 'max_output_tokens': 4096,
+                        'reasoning': {'effort': reasoning['effort']}, 'max_output_tokens': 4096,
                         'audio': {'input': {'format': {'type': 'audio/pcm', 'rate': 24000}, 'turn_detection': None}},
                         'tools': [],
-                    }})
+                    }}
+                    await ws.send_json(session_update)
+                    metrics['reasoning_sent'].append(reasoning['effort'])
                     while True:
                         event = await ws.receive_json()
                         if event.get('type') == 'error':
+                            rejection = effort_schema_rejection(event.get('error'))
+                            if (reasoning['effort'] == 'none' and reasoning.get('compat_fallback_enabled')
+                                    and len(metrics['reasoning_sent']) == 1 and rejection is not None):
+                                # Still inside the original setup deadline. No audio sender
+                                # or response exists before session.updated acknowledges it.
+                                session_update['session']['reasoning']['effort'] = COMPAT_REASONING_FALLBACK
+                                await ws.send_json(session_update)
+                                metrics['reasoning_sent'].append(COMPAT_REASONING_FALLBACK)
+                                metrics['reasoning'] = COMPAT_REASONING_FALLBACK
+                                metrics['reasoning_fallback'] = {
+                                    'from': 'none', 'to': COMPAT_REASONING_FALLBACK,
+                                    'reason': 'schema_effort_rejected',
+                                    'error_code': rejection['code'], 'error_param': rejection['param']}
+                                active_reasoning.update(effort=COMPAT_REASONING_FALLBACK,
+                                    status='compatibility_fallback', fallback_reason='schema_effort_rejected',
+                                    fallback_error_code=rejection['code'], fallback_error_param=rejection['param'])
+                                continue
                             raise upstream_failure(event.get('error'))
                         if event.get('type') == 'session.updated':
+                            metrics['reasoning_session_accepted'] = metrics['reasoning']
+                            active_reasoning['session_accepted'] = True
                             break
                 await ready()
                 metrics['ready_s'] = round(time.monotonic() - start, 3)
@@ -247,6 +340,9 @@ class RealtimeEngine:
                 record_metrics(metrics)
             except OSError:
                 pass  # Optional diagnostics must not change a recognition result.
+            finally:
+                if ACTIVE_REASONING is active_reasoning:
+                    ACTIVE_REASONING = None
 
 
 async def handle(request, lock, engine=None):
