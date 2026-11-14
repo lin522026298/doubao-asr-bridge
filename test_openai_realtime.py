@@ -31,14 +31,29 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.received = []
         self.behavior = 'success'
         self.config = None
+        self.configs = []
+        self.session_errors = []
+        self.upstream_events = []
+        self.response_requested = asyncio.Event()
+        self.retry_received = asyncio.Event()
+        self.settings_value = {}
+        self.settings_error = None
+        self.settings_calls = 0
+        self.settings_loaded = asyncio.Event()
         self.upstream_closed = asyncio.Event()
         app = web.Application()
         app.router.add_get('/upstream', self.upstream)
         self.server = TestServer(app)
         await self.server.start_server()
+        def settings_loader():
+            self.settings_calls += 1
+            self.settings_loaded.set()
+            if self.settings_error is not None:
+                raise self.settings_error
+            return self.settings_value
         engine = rt.RealtimeEngine(upstream=str(self.server.make_url('/upstream')),
                      key_loader=lambda: 'synthetic-key', prompt_loader=lambda: ('Synthetic prompt', {'history_turns': 0}),
-                     cursor_factory=lambda: None)
+                     cursor_factory=lambda: None, settings_loader=settings_loader)
         local = web.Application()
         async def route(request):
             return await rt.handle(request, self.lock, engine)
@@ -63,12 +78,30 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                     break
                 event = json.loads(message.data)
                 kind = event['type']
+                self.upstream_events.append(kind)
                 if kind == 'session.update':
                     self.config = event['session']
+                    self.configs.append(self.config)
+                    if self.behavior == 'close_before_session_ack':
+                        await ws.close()
+                        break
+                    if self.session_errors:
+                        error = self.session_errors.pop(0)
+                        if error is not None:
+                            await ws.send_json({'type': 'error', 'error': error})
+                            continue
+                    if self.behavior == 'hold_retry_ack' and len(self.configs) > 1:
+                        self.retry_received.set()
+                        await self.release.wait()
+                        if request.transport is None or request.transport.is_closing():
+                            break
                     await ws.send_json({'type': 'session.updated'})
                 elif kind == 'input_audio_buffer.append':
                     self.received.append(base64.b64decode(event['audio']))
                 elif kind == 'response.create':
+                    self.response_requested.set()
+                    if self.behavior == 'hold_response':
+                        await self.release.wait()
                     if self.behavior == 'empty_completed':
                         await ws.send_json({'type': 'response.done', 'response': {'status': 'completed',
                             'usage': {'input_tokens': 10, 'output_tokens': 0}}})
@@ -108,6 +141,259 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             events.append(event)
             if event['type'] in ('session.finished', 'conversation.item.input_audio_transcription.failed'):
                 return events
+
+    async def close_and_wait(self, ws, metric_count):
+        await ws.close()
+        async with asyncio.timeout(1):
+            while self.lock.locked() or len(self.metrics) < metric_count:
+                await asyncio.sleep(.01)
+
+    def reasoning_health(self):
+        def settings_loader():
+            if self.settings_error is not None:
+                raise self.settings_error
+            return self.settings_value
+        with patch.object(rt, 'key_status', return_value='synthetic'), \
+             patch.object(rt, 'cursor_policy', return_value={'enabled': False}):
+            return rt.health_status(settings_loader=settings_loader)
+
+    async def test_default_reasoning_is_sent_and_reported(self):
+        ws = await self.open_stream()
+        await self.send(ws)
+        self.assertEqual((await self.events(ws))[-1]['type'], 'session.finished')
+        await self.close_and_wait(ws, 1)
+        self.assertEqual(self.config['reasoning'], {'effort': 'low'})
+        self.assertEqual(self.metrics[-1]['reasoning'], 'low')
+        self.assertEqual(self.metrics[-1]['reasoning_config']['status'], 'default')
+        self.assertEqual(self.settings_calls, 1)
+        self.assertEqual(self.reasoning_health()['reasoning'], 'low')
+        self.assertIsNone(self.reasoning_health()['active_reasoning'])
+
+    async def test_each_supported_reasoning_effort_reaches_session_update(self):
+        for index, effort in enumerate(('minimal', 'low', 'medium', 'high', 'xhigh'), 1):
+            with self.subTest(effort=effort):
+                self.settings_value = {'reasoning': effort}
+                ws = await self.open_stream()
+                await self.send(ws)
+                self.assertEqual((await self.events(ws))[-1]['type'], 'session.finished')
+                await self.close_and_wait(ws, index)
+                self.assertEqual(self.config['reasoning'], {'effort': effort})
+                self.assertEqual(self.metrics[-1]['reasoning'], effort)
+                self.assertEqual(self.metrics[-1]['reasoning_config']['status'], 'configured')
+                self.assertEqual(self.reasoning_health()['reasoning'], effort)
+        self.assertEqual(self.settings_calls, 5)
+
+    async def test_none_is_opt_in_experimental_in_session_health_and_metrics(self):
+        self.settings_value = {'reasoning': 'none'}
+        ws = await self.open_stream()
+        await self.send(ws)
+        self.assertEqual((await self.events(ws))[-1]['type'], 'session.finished')
+        await self.close_and_wait(ws, 1)
+        self.assertEqual(self.config['reasoning'], {'effort': 'none'})
+        self.assertEqual(self.metrics[-1]['reasoning'], 'none')
+        self.assertEqual(self.metrics[-1]['reasoning_config']['status'], 'configured_experimental')
+        health = self.reasoning_health()
+        self.assertEqual(health['reasoning'], 'none')
+        self.assertEqual(health['reasoning_config']['status'], 'configured_experimental')
+        self.assertEqual(self.settings_calls, 1)
+
+    async def test_none_schema_rejection_retries_low_once_before_any_audio(self):
+        self.settings_value = {'reasoning': 'none'}
+        self.session_errors = [{'code': 'invalid_value', 'type': 'invalid_request_error',
+            'param': 'session.reasoning.effort', 'message': 'synthetic-key private error text'}]
+        self.behavior = 'hold_response'
+        ws = await self.open_stream()
+        chunks = await self.send(ws)
+        await asyncio.wait_for(self.response_requested.wait(), 1)
+        health = self.reasoning_health()
+        self.assertEqual(health['reasoning'], 'low')
+        self.assertEqual(health['active_reasoning']['configured_effort'], 'none')
+        self.assertEqual(health['active_reasoning']['status'], 'compatibility_fallback')
+        self.assertTrue(health['active_reasoning']['session_accepted'])
+        self.assertEqual(health['reasoning_config']['effort'], 'none')
+        self.release.set()
+        self.assertEqual((await self.events(ws))[-1]['type'], 'session.finished')
+        await self.close_and_wait(ws, 1)
+        self.assertEqual([c['reasoning']['effort'] for c in self.configs], ['none', 'low'])
+        self.assertEqual(self.upstream_events[:2], ['session.update', 'session.update'])
+        self.assertEqual(self.upstream_events.count('input_audio_buffer.commit'), 1)
+        self.assertEqual(self.upstream_events.count('response.create'), 1)
+        expected, _ = audioop.ratecv(b''.join(chunks), 2, 1, 16000, 24000, None)
+        self.assertEqual(b''.join(self.received), expected, 'The retry must preserve every audio frame and tail')
+        metric = self.metrics[-1]
+        self.assertEqual(metric['reasoning_config']['effort'], 'none')
+        self.assertEqual(metric['reasoning'], 'low')
+        self.assertEqual(metric['reasoning_sent'], ['none', 'low'])
+        self.assertEqual(metric['reasoning_session_accepted'], 'low')
+        self.assertEqual(metric['reasoning_fallback'], {
+            'from': 'none', 'to': 'low', 'reason': 'schema_effort_rejected',
+            'error_code': 'invalid_value', 'error_param': 'session.reasoning.effort'})
+        self.assertNotIn('synthetic-key', json.dumps([metric, health]))
+        self.assertIsNone(self.reasoning_health()['active_reasoning'])
+
+    async def test_none_fallback_accepts_only_the_enumerated_schema_codes_and_paths(self):
+        cases = (('unsupported_value', 'reasoning.effort'),
+                 ('invalid_parameter', 'session.reasoning.effort'),
+                 ('invalid_enum_value', 'reasoning.effort'),
+                 ('unsupported_parameter_value', 'session.reasoning.effort'))
+        for index, (code, param) in enumerate(cases, 1):
+            with self.subTest(code=code, param=param):
+                self.settings_value = {'reasoning': 'none'}
+                self.session_errors = [{'code': code, 'param': param}]
+                self.configs.clear()
+                ws = await self.open_stream()
+                await self.send(ws)
+                self.assertEqual((await self.events(ws))[-1]['type'], 'session.finished')
+                await self.close_and_wait(ws, index)
+                self.assertEqual([c['reasoning']['effort'] for c in self.configs], ['none', 'low'])
+                self.assertEqual(self.metrics[-1]['reasoning_session_accepted'], 'low')
+
+    async def test_unrelated_errors_other_efforts_and_disabled_policy_never_retry(self):
+        cases = [
+            ({'reasoning': 'none'}, {'code': 'invalid_api_key', 'param': 'session.reasoning.effort'}),
+            ({'reasoning': 'none'}, {'code': 'insufficient_quota', 'param': 'session.reasoning.effort'}),
+            ({'reasoning': 'none'}, {'code': 'rate_limit_exceeded', 'param': 'session.reasoning.effort'}),
+            ({'reasoning': 'none'}, {'code': 'invalid_value', 'param': 'session.audio.input.format'}),
+            ({'reasoning': 'none'}, {'code': 'invalid_value', 'param': 'session.reasoning'}),
+            ({'reasoning': 'none'}, {'code': 'invalid_value', 'param': 'response.reasoning.effort'}),
+            ({'reasoning': 'none'}, {'code': 'invalid_value'}),
+            ({'reasoning': 'none'}, {'code': 'unknown_error', 'param': 'reasoning.effort'}),
+            ({'reasoning': 'none'}, {'code': 'invalid_value', 'param': 'reasoning.effort', 'type': 'authentication_error'}),
+            ({'reasoning': 'medium'}, {'code': 'invalid_value', 'param': 'reasoning.effort'}),
+            ({'reasoning': 'none', 'reasoning_compat_fallback': False}, {'code': 'invalid_value', 'param': 'reasoning.effort'}),
+        ]
+        for index, (config, error) in enumerate(cases, 1):
+            with self.subTest(case=index):
+                self.settings_value = config
+                self.session_errors = [dict(error, message='synthetic-key says session.reasoning.effort is invalid')]
+                self.configs.clear()
+                self.upstream_events.clear()
+                ws = await self.open_stream()
+                await self.send(ws)
+                self.assertEqual((await self.events(ws))[-1]['type'], 'conversation.item.input_audio_transcription.failed')
+                await self.close_and_wait(ws, index)
+                self.assertEqual([c['reasoning']['effort'] for c in self.configs], [config['reasoning']])
+                self.assertEqual(self.upstream_events, ['session.update'])
+                self.assertIsNone(self.metrics[-1]['reasoning_fallback'])
+                self.assertIsNone(self.metrics[-1]['reasoning_session_accepted'])
+                self.assertNotIn('synthetic-key', json.dumps(self.metrics[-1]))
+                self.assertIsNone(self.reasoning_health()['active_reasoning'])
+
+    async def test_second_effort_rejection_is_not_retried_again(self):
+        self.settings_value = {'reasoning': 'none'}
+        error = {'code': 'invalid_value', 'param': 'session.reasoning.effort'}
+        self.session_errors = [error, error]
+        ws = await self.open_stream()
+        await self.send(ws)
+        self.assertEqual((await self.events(ws))[-1]['type'], 'conversation.item.input_audio_transcription.failed')
+        await self.close_and_wait(ws, 1)
+        self.assertEqual([c['reasoning']['effort'] for c in self.configs], ['none', 'low'])
+        self.assertEqual(self.upstream_events, ['session.update', 'session.update'])
+        self.assertEqual(self.metrics[-1]['reasoning_sent'], ['none', 'low'])
+        self.assertIsNone(self.metrics[-1]['reasoning_session_accepted'])
+
+    async def test_network_close_before_ack_never_retries(self):
+        self.settings_value = {'reasoning': 'none'}
+        self.behavior = 'close_before_session_ack'
+        ws = await self.open_stream()
+        await self.send(ws)
+        self.assertEqual((await self.events(ws))[-1]['type'], 'conversation.item.input_audio_transcription.failed')
+        await self.close_and_wait(ws, 1)
+        self.assertEqual(self.upstream_events, ['session.update'])
+        self.assertEqual(self.metrics[-1]['reasoning_sent'], ['none'])
+        self.assertIsNone(self.metrics[-1]['reasoning_fallback'])
+
+    async def test_cancel_while_waiting_for_retry_ack_clears_active_state(self):
+        self.settings_value = {'reasoning': 'none'}
+        self.session_errors = [{'code': 'invalid_value', 'param': 'session.reasoning.effort'}]
+        self.behavior = 'hold_retry_ack'
+        ws = await self.open_stream()
+        await asyncio.wait_for(self.retry_received.wait(), 1)
+        self.assertEqual(self.reasoning_health()['reasoning'], 'low')
+        self.assertFalse(self.reasoning_health()['active_reasoning']['session_accepted'])
+        await self.close_and_wait(ws, 1)
+        self.release.set()
+        self.assertEqual(self.upstream_events, ['session.update', 'session.update'])
+        self.assertEqual(self.metrics[-1]['status'], 'cancelled')
+        self.assertIsNone(self.metrics[-1]['reasoning_session_accepted'])
+        self.assertIsNone(self.reasoning_health()['active_reasoning'])
+
+    async def test_compatibility_policy_is_frozen_with_the_recording(self):
+        self.settings_value = {'reasoning': 'none', 'reasoning_compat_fallback': True}
+        self.session_errors = [{'code': 'invalid_value', 'param': 'reasoning.effort'}]
+        self.behavior = 'delayed_ready'
+        ws = await self.open_stream()
+        await asyncio.wait_for(self.settings_loaded.wait(), 1)
+        self.settings_value['reasoning_compat_fallback'] = False
+        await self.send(ws)
+        self.release.set()
+        self.assertEqual((await self.events(ws))[-1]['type'], 'session.finished')
+        await self.close_and_wait(ws, 1)
+        self.assertEqual(self.metrics[-1]['reasoning_sent'], ['none', 'low'])
+        self.assertTrue(self.metrics[-1]['reasoning_config']['compat_fallback_enabled'])
+        self.assertFalse(self.reasoning_health()['reasoning_config']['compat_fallback_enabled'])
+        self.assertEqual(self.settings_calls, 1)
+
+    async def test_reasoning_freezes_before_connect_and_reloads_next_recording(self):
+        self.behavior = 'delayed_ready'
+        self.settings_value = {'reasoning': 'medium'}
+        ws = await self.open_stream()
+        await asyncio.wait_for(self.settings_loaded.wait(), 1)
+        self.settings_value['reasoning'] = 'high'
+        active = self.reasoning_health()
+        self.assertEqual(active['reasoning'], 'medium')
+        self.assertEqual(active['reasoning_source'], 'active_recording')
+        self.assertEqual(active['active_reasoning']['effort'], 'medium')
+        self.assertEqual(active['reasoning_config']['effort'], 'high')
+        await self.send(ws)
+        self.release.set()
+        self.assertEqual((await self.events(ws))[-1]['type'], 'session.finished')
+        await self.close_and_wait(ws, 1)
+        self.assertEqual(self.configs[0]['reasoning'], {'effort': 'medium'})
+        self.assertEqual(self.metrics[0]['reasoning'], 'medium')
+        self.assertEqual(self.settings_calls, 1)
+        self.assertEqual(self.reasoning_health()['reasoning_source'], 'next_recording')
+        self.assertIsNone(self.reasoning_health()['active_reasoning'])
+
+        self.behavior = 'success'
+        ws = await self.open_stream()
+        await self.send(ws)
+        self.assertEqual((await self.events(ws))[-1]['type'], 'session.finished')
+        await self.close_and_wait(ws, 2)
+        self.assertEqual(self.configs[1]['reasoning'], {'effort': 'high'})
+        self.assertEqual(self.metrics[1]['reasoning'], 'high')
+        self.assertEqual(self.settings_calls, 2)
+
+    async def test_invalid_reasoning_falls_back_without_logging_raw_settings(self):
+        values = ('disabled', None, False, 42, ['synthetic-key'], {'private': 'synthetic-key'}, 'synthetic-key')
+        for index, value in enumerate(values, 1):
+            with self.subTest(value_type=type(value).__name__):
+                self.settings_value = {'reasoning': value, 'private': 'synthetic-key'}
+                ws = await self.open_stream()
+                await self.send(ws)
+                self.assertEqual((await self.events(ws))[-1]['type'], 'session.finished')
+                await self.close_and_wait(ws, index)
+                self.assertEqual(self.config['reasoning'], {'effort': 'low'})
+                self.assertEqual(self.metrics[-1]['reasoning'], 'low')
+                self.assertEqual(self.metrics[-1]['reasoning_config']['status'], 'invalid_fallback')
+                health = self.reasoning_health()
+                self.assertEqual(health['reasoning'], 'low')
+                self.assertEqual(health['reasoning_config']['status'], 'invalid_fallback')
+                self.assertNotIn('synthetic-key', json.dumps([self.metrics[-1], health]))
+
+    async def test_unavailable_settings_fall_back_and_keep_safe_diagnostics(self):
+        self.settings_error = OSError('synthetic-key and private settings details')
+        ws = await self.open_stream()
+        await self.send(ws)
+        self.assertEqual((await self.events(ws))[-1]['type'], 'session.finished')
+        await self.close_and_wait(ws, 1)
+        self.assertEqual(self.config['reasoning'], {'effort': 'low'})
+        self.assertEqual(self.metrics[-1]['reasoning_config'], {
+            'effort': 'low', 'status': 'unavailable_fallback', 'reason': 'settings_read_failed'})
+        health = self.reasoning_health()
+        self.assertEqual(health['reasoning_config']['status'], 'unavailable_fallback')
+        self.assertNotIn('synthetic-key', json.dumps([self.metrics, health]))
+        self.assertEqual(self.settings_calls, 1)
 
     async def test_exact_resampling_tail_and_text_only(self):
         ws = await self.open_stream()
@@ -231,6 +517,20 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ProfileAndCredentialTests(unittest.TestCase):
+    def test_reasoning_file_defaults_and_corruption_are_distinguishable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'settings.json'
+            with patch.object(rt, 'REALTIME_SETTINGS', path):
+                self.assertEqual(rt.reasoning_snapshot(), {'effort': 'low', 'status': 'default'})
+                path.write_text(json.dumps({'reasoning': 'minimal'}), encoding='utf-8-sig')
+                self.assertEqual(rt.reasoning_snapshot(), {'effort': 'minimal', 'status': 'configured'})
+                path.write_text('{invalid synthetic-key', encoding='utf-8')
+                invalid = rt.reasoning_snapshot()
+                self.assertEqual(invalid['status'], 'unavailable_fallback')
+                self.assertNotIn('synthetic-key', json.dumps(invalid))
+                path.write_text('[]', encoding='utf-8')
+                self.assertEqual(rt.reasoning_snapshot()['reason'], 'invalid_settings')
+
     def test_enable_preserves_llm_shortcuts_and_doubao(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
